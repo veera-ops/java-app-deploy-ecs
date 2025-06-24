@@ -1,0 +1,87 @@
+name: CI/CD: Build, Push, Deploy to ECS
+
+on:
+  push:
+    branches:
+      - dev
+      - qa
+      - master
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: java-ecr-demo-cluster
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Build with Maven
+        run: mvn clean package
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set environment values based on branch
+        id: set_env
+        run: |
+          BRANCH="${GITHUB_REF##*/}"
+          if [ "$BRANCH" = "dev" ]; then
+            echo "ECR_REPO=java-ecr-dev-repo" >> $GITHUB_ENV
+            echo "SERVICE_NAME=java-ecr-dev-service" >> $GITHUB_ENV
+          elif [ "$BRANCH" = "qa" ]; then
+            echo "ECR_REPO=java-ecr-qa-repo" >> $GITHUB_ENV
+            echo "SERVICE_NAME=java-ecr-qa-service" >> $GITHUB_ENV
+          elif [ "$BRANCH" = "master" ]; then
+            echo "ECR_REPO=java-ecr-prod-repo" >> $GITHUB_ENV
+            echo "SERVICE_NAME=java-ecr-prod-service" >> $GITHUB_ENV
+          else
+            echo "Unsupported branch: $BRANCH"
+            exit 1
+          fi
+
+      - name: Build Docker image
+        run: |
+          docker build -t $ECR_REPO:$GITHUB_REF_NAME .
+
+      - name: Tag and push image to ECR
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO
+          docker tag $ECR_REPO:$GITHUB_REF_NAME $ECR_URI:$GITHUB_REF_NAME
+          docker push $ECR_URI:$GITHUB_REF_NAME
+          echo "ECR_URI=$ECR_URI" >> $GITHUB_ENV
+
+      - name: Register updated ECS Task Definition
+        id: task-def
+        run: |
+          TASK_FAMILY=$SERVICE_NAME
+          IMAGE="$ECR_URI:$GITHUB_REF_NAME"
+          NEW_DEF=$(aws ecs describe-task-definition --task-definition $TASK_FAMILY)
+          echo "$NEW_DEF" | jq --arg IMAGE "$IMAGE" '.taskDefinition.containerDefinitions[0].image = $IMAGE |
+                                                     {family: .taskDefinition.family, containerDefinitions: .taskDefinition.containerDefinitions}' > task-def.json
+          echo "task-def.json created"
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: task-def.json
+          service: ${{ env.SERVICE_NAME }}
+          cluster: ${{ env.CLUSTER_NAME }}
+          wait-for-service-stability: true
